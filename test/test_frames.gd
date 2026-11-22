@@ -1,6 +1,6 @@
+extends GutTest
 ## The frames Godobuf generates, against bytes encoded by hand from playhold's frames.proto, the way Go's protobuf
 ## encodes them: fields in number order, proto3 defaults left out.
-extends GutTest
 
 const Frames = preload("res://addons/playhold/frames.gd")
 

@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package counter;
+
+// The messages of the test server's counter module, for the client tests. The server uses protobuf wrappers; these
+// have the same fields, so the same bytes.
+
+// Amount is what the counter adds to the room total, as an Int32Value.
+message Amount {
+  int32 value = 1;
+}
+
+// Total is the counter view, "<player>:<total>", as a StringValue.
+message Total {
+  string text = 1;
+}

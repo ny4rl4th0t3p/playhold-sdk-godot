@@ -27,6 +27,12 @@ fetch = @if [ -e $(4) ]; then \
 		mkdir -p $(dir $(4)) && cp -R .tools/$(5)/$(3) $(4) && echo '$(2)' > $(4)/.ref; \
 	fi
 
+# godobuf generates GDScript from .proto file $(1) into $(2). Godobuf exits 0 even when it fails, so this fails unless
+# it printed the line it ends a success with.
+godobuf = @out=$$($(GODOT) --headless -s addons/godobuf/godobuf_cmdln.gd --input=$(1) --output=$(2) 2>&1); \
+	echo "$$out"; \
+	case "$$out" in *"Compiled '$(1)'"*) ;; *) echo "Godobuf couldn't generate $(2) from $(1)"; exit 1;; esac
+
 .DEFAULT_GOAL := help
 
 .PHONY: help check tools gen test server pin tidy
@@ -40,15 +46,22 @@ tools: ## Fetch Godobuf and GUT into addons/, at their pinned refs
 	$(call fetch,$(GODOBUF_REPO),$(GODOBUF_REF),addons/godobuf,addons/godobuf,godobuf)
 	$(call fetch,$(GUT_REPO),$(GUT_REF),addons/gut,addons/gut,gut)
 
-gen: tools ## Generate addons/playhold/frames.gd from playhold's frames.proto at PLAYHOLD_VERSION
-	@mkdir -p addons/playhold && \
-	$(BUF) export '$(PROTO)' --path playhold/v1/frames.proto -o .tools/proto && \
-	$(GODOT) --headless -s addons/godobuf/godobuf_cmdln.gd \
-		--input=.tools/proto/playhold/v1/frames.proto --output=addons/playhold/frames.gd
+gen: tools ## Generate addons/playhold/frames.gd from playhold's proto at PLAYHOLD_VERSION, and the tests' counter.gd
+	@mkdir -p addons/playhold
+	$(BUF) export '$(PROTO)' --path playhold/v1/frames.proto -o .tools/proto
+	$(call godobuf,.tools/proto/playhold/v1/frames.proto,addons/playhold/frames.gd)
+	$(call godobuf,test/counter.proto,test/counter.gd)
 
-test: tools ## Run the tests, with Godot headless; GUT reads which ones from .gutconfig.json
+# test starts the test server, waits up to 10 s for the URL it prints, and passes it to the tests in PLAYHOLD_TEST_URL.
+# The trap stops the server however the tests end; the binary and its URL file are overwritten on each run.
+test: tools ## Run the tests, with Godot headless, against the test server; GUT reads which ones from .gutconfig.json
 	$(GODOT) --headless --import
-	$(GODOT) --headless -s addons/gut/gut_cmdln.gd -gexit
+	cd testserver && go build -o ../.tools/testserver .
+	@.tools/testserver > .tools/testserver.url & server=$$!; \
+	trap 'kill $$server' EXIT; \
+	for i in $$(seq 100); do [ -s .tools/testserver.url ] && break; sleep 0.1; done; \
+	read -r url < .tools/testserver.url || { echo "the test server didn't print its URL"; exit 1; }; \
+	PLAYHOLD_TEST_URL=$$url $(GODOT) --headless -s addons/gut/gut_cmdln.gd -gexit
 
 server: ## Build and vet the test server
 	cd testserver && go build -o /dev/null . # a single main package: without -o, go build would write the binary here

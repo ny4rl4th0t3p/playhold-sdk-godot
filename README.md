@@ -3,7 +3,8 @@
 Connects a Godot game to a [playhold](https://github.com/ny4rl4th0t3p/playhold) server, in GDScript, so it runs in
 every export, the web included.
 
-> **Status: early development.** This repository has the protocol's frames and their tests; the client comes next.
+> **Status: early development.** The client connects, keeps the guest's identity, joins and creates rooms, sends
+> messages and receives views. Reconnecting and matchmaking come next.
 
 ## Versions
 
@@ -22,8 +23,8 @@ which tests to run from `.gutconfig.json`.
 
 ```bash
 make tools   # fetch Godobuf and GUT
-make check   # run the tests, build the test server, and check the pinned versions
-make gen     # generate addons/playhold/frames.gd from playhold's proto at PLAYHOLD_VERSION
+make check   # run the tests against the test server, build it, and check the pinned versions
+make gen     # generate addons/playhold/frames.gd from playhold's proto at PLAYHOLD_VERSION, and test/counter.gd
 make tidy    # tidy the test server's module
 ```
 

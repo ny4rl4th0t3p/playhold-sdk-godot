@@ -1,4 +1,5 @@
 {
 	"dirs": ["res://test/"],
-	"include_subdirs": true
+	"include_subdirs": true,
+	"post_run_script": "res://test/post_run.gd"
 }
