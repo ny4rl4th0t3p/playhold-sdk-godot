@@ -14,7 +14,9 @@ extends Node
 ## client.connect_to_url("wss://game.example.com")
 ## client.create_room()
 ## [/codeblock]
-## Messages sent while not in a room aren't kept or sent later. A player who comes back receives the whole view.
+## When the connection drops, the client connects again by itself, after a delay that grows with each failed attempt,
+## and goes back to its room. It stops for good only when the server says so: see [enum Status]. Messages sent while
+## not in a room aren't kept or sent later. A player who comes back receives the whole view.
 
 ## Emitted each time [member status] changes.
 signal status_changed(status: Status)
@@ -24,22 +26,30 @@ signal room_joined(code: String)
 ## Emitted with everything the player can see in the room: a Dictionary from each module's name to its view, as that
 ## module's own message in bytes.
 signal views_received(views: Dictionary)
+## Emitted when the player's room has closed, with one of [code]Frames.CloseReason[/code]. The client is still
+## connected, and can join another room.
+signal room_closed(reason: int)
 ## Emitted when the server reports a problem. [param seq] is the number [method send] returned for the frame it's
 ## about, [param code] one of [code]Frames.ErrorCode[/code], and [param message] a description for logs and developers.
 signal server_error(seq: int, code: int, message: String)
 
 ## Where the client is.
 enum Status {
-	DISCONNECTED, ## Not connected.
+	DISCONNECTED, ## Not connected: the connection was lost and the client retries after a delay, or it never started.
 	CONNECTING, ## Opening a connection and saying hello.
 	CONNECTED, ## The server knows this player, who isn't in a room.
 	JOINED, ## In a room: messages can be sent.
+	REPLACED, ## The same player connected somewhere newer. Stopped until [method PlayholdClient.connect_to_url].
+	CLOSED, ## Stopped by [method PlayholdClient.close].
+	UPDATE_REQUIRED, ## This game is too old for the server, and has stopped. The player needs a newer one.
 }
 
 const Frames = preload("frames.gd")
 const _Identity = preload("identity.gd")
 
 const _PROTOCOL_VERSION := 1
+## The close status of a connection replaced by a newer one from the same player.
+const _CLOSE_REPLACED := 4001
 
 ## Which version of each module's messages this game was built for, such as [code]{"board": 2}[/code], so the server
 ## can tell when it's too old.
@@ -47,6 +57,12 @@ const _PROTOCOL_VERSION := 1
 ## Where the guest's identity is saved, read when the client first connects. An empty path keeps it in memory only, so
 ## each run of the game is a new guest.
 @export var identity_path := "user://playhold_identity.cfg"
+## The delay before the first retry after a lost connection, in seconds. It doubles with each failed attempt, up to
+## [member max_retry_delay], and each delay is a random 50-100% of that, so players dropped together don't all come
+## back at once.
+@export var min_retry_delay := 0.5
+## The longest delay between retries, in seconds.
+@export var max_retry_delay := 15.0
 
 ## Where the client is: see [signal status_changed].
 var status: Status:
@@ -57,12 +73,16 @@ var player_id: String:
 	get:
 		return _player_id
 
+var _url := ""
 var _socket: WebSocketPeer
 var _identity: _Identity
 var _status := Status.DISCONNECTED
 var _player_id := ""
 var _said_hello := false
 var _last_seq := 0
+## When to connect again, in [method Time.get_ticks_msec]; -1 for no retry waiting.
+var _retry_at := -1
+var _failed_attempts := 0
 ## Whether the player wants to be in a room, with [member _code]; an empty code asks the server for a new room.
 var _wants_room := false
 var _code := ""
@@ -75,6 +95,10 @@ func _init() -> void:
 
 
 func _process(_delta: float) -> void:
+	if _retry_at >= 0 and Time.get_ticks_msec() >= _retry_at:
+		_retry_at = -1
+		if _open() != OK:
+			_retry_later()
 	if _socket == null:
 		return
 	_socket.poll()
@@ -86,25 +110,19 @@ func _process(_delta: float) -> void:
 		if not _socket.was_string_packet(): # the server only sends binary frames
 			_receive(packet)
 	if _socket != null and _socket.get_ready_state() == WebSocketPeer.STATE_CLOSED:
-		_dropped()
+		_socket_closed()
 
 
-## Starts connecting to the server at [param url], such as [code]wss://game.example.com[/code]. Returns
-## [constant ERR_ALREADY_IN_USE] while already connecting or connected, or the error that kept the connection from
-## starting.
+## Starts connecting to the server at [param url], such as [code]wss://game.example.com[/code], and keeps connecting
+## again after a lost connection until [method close]. After [constant REPLACED], [constant CLOSED] or
+## [constant UPDATE_REQUIRED], it starts again. Returns [constant ERR_ALREADY_IN_USE] while connecting, connected or
+## waiting to retry, or the error that kept the connection from starting.
 func connect_to_url(url: String) -> Error:
-	if _socket != null:
+	if _socket != null or _retry_at >= 0:
 		return ERR_ALREADY_IN_USE
-	if _identity == null:
-		_identity = _Identity.new(identity_path)
-	var socket := WebSocketPeer.new()
-	var error := socket.connect_to_url(url)
-	if error != OK:
-		return error
-	_socket = socket
-	_said_hello = false
-	_set_status(Status.CONNECTING)
-	return OK
+	_url = url
+	_failed_attempts = 0
+	return _open()
 
 
 ## Enters the room with this code, now or as soon as the client is connected; [signal room_joined] follows. A code no
@@ -141,24 +159,59 @@ func send(module: String, id: int, payload: PackedByteArray) -> int:
 	return _send(frame)
 
 
-## Disconnects and forgets the room. The guest's identity is kept for next time.
+## Disconnects, stops connecting again, and forgets the room. The guest's identity is kept for next time.
 func close() -> void:
+	_wants_room = false
+	_code = ""
+	_stop(Status.CLOSED)
+
+
+func _open() -> Error:
+	if _identity == null:
+		_identity = _Identity.new(identity_path)
+	var socket := WebSocketPeer.new()
+	var error := socket.connect_to_url(_url)
+	if error != OK:
+		return error
+	_socket = socket
+	_said_hello = false
+	_set_status(Status.CONNECTING)
+	return OK
+
+
+## The connection closed, or never opened, without [method close]. The room is kept, so the retry goes back to it.
+func _socket_closed() -> void:
+	var close_code := _socket.get_close_code()
+	_socket = null
+	_player_id = ""
+	_join_seq = 0
+	if close_code == _CLOSE_REPLACED:
+		_set_status(Status.REPLACED)
+		return
+	_set_status(Status.DISCONNECTED)
+	_retry_later()
+
+
+func _retry_later() -> void:
+	_retry_at = Time.get_ticks_msec() + int(_retry_delay(_failed_attempts) * 1000)
+	_failed_attempts += 1
+
+
+## The delay before retry number [param attempt], from 0, in seconds.
+func _retry_delay(attempt: int) -> float:
+	var delay := minf(max_retry_delay, min_retry_delay * pow(2, attempt))
+	return delay * (0.5 + 0.5 * randf())
+
+
+## Closes the connection and stops at [param new_status], with no retry.
+func _stop(new_status: Status) -> void:
+	_retry_at = -1
 	if _socket != null:
 		_socket.close()
 	_socket = null
 	_player_id = ""
-	_wants_room = false
-	_code = ""
 	_join_seq = 0
-	_set_status(Status.DISCONNECTED)
-
-
-## The connection closed without [method close]. The room is kept, so connecting again goes back to it.
-func _dropped() -> void:
-	_socket = null
-	_player_id = ""
-	_join_seq = 0
-	_set_status(Status.DISCONNECTED)
+	_set_status(new_status)
 
 
 func _receive(bytes: PackedByteArray) -> void:
@@ -173,11 +226,14 @@ func _receive(bytes: PackedByteArray) -> void:
 			_joined(frame.get_joined())
 		Frames.ServerFrame.BodyCase.STATE:
 			_views(frame.get_state())
+		Frames.ServerFrame.BodyCase.CLOSED:
+			_room_closed(frame.get_closed())
 		Frames.ServerFrame.BodyCase.ERROR:
 			_failed(frame.get_error())
 
 
 func _welcomed(welcome: Frames.Welcome) -> void:
+	_failed_attempts = 0
 	_player_id = welcome.get_player_id()
 	if welcome.get_secret() != "": # only a new guest gets one
 		_identity.write(_player_id, welcome.get_secret())
@@ -200,6 +256,14 @@ func _views(state: Frames.RoomState) -> void:
 	views_received.emit(views)
 
 
+func _room_closed(closed: Frames.RoomClosed) -> void:
+	_wants_room = false
+	_code = ""
+	_join_seq = 0
+	_set_status(Status.CONNECTED)
+	room_closed.emit(closed.get_reason())
+
+
 func _failed(error: Frames.ServerError) -> void:
 	var seq: int = error.get_seq()
 	var code: int = error.get_code()
@@ -207,6 +271,15 @@ func _failed(error: Frames.ServerError) -> void:
 		# The server doesn't know this guest, for example after it lost its data. Start again as a new one.
 		_identity.clear()
 		_send_hello()
+	elif code == Frames.ErrorCode.UNSUPPORTED_PROTOCOL or code == Frames.ErrorCode.UPDATE_REQUIRED:
+		_stop(Status.UPDATE_REQUIRED)
+	elif code == Frames.ErrorCode.UNAVAILABLE or (
+		code == Frames.ErrorCode.RATE_LIMITED and (_player_id == "" or (seq != 0 and seq == _join_seq))
+	):
+		# The server couldn't check this player, or asked it to slow down before it got into its room. Closing leads
+		# to the usual retry, with its growing delay, and keeps the room to try again.
+		if _socket != null:
+			_socket.close()
 	elif seq != 0 and seq == _join_seq:
 		# The room refused this player: forget its code, so connecting again doesn't try it again.
 		_wants_room = false

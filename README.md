@@ -4,7 +4,7 @@ Connects a Godot game to a [playhold](https://github.com/ny4rl4th0t3p/playhold) 
 every export, the web included.
 
 > **Status: early development.** The client connects, keeps the guest's identity, joins and creates rooms, sends
-> messages and receives views. Reconnecting and matchmaking come next.
+> messages, receives views, and connects again by itself after a lost connection. Matchmaking comes next.
 
 ## Versions
 

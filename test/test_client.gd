@@ -8,17 +8,25 @@ const Identity = preload("res://addons/playhold/identity.gd")
 const Counter = preload("res://test/counter.gd")
 
 const _MSG_ADD := 1
+const _MSG_CLOSE := 2
 ## How long to wait for the server, in seconds.
 const _WAIT := 5.0
+## How long to wait to see that something doesn't happen, such as a retry after the client stopped, in seconds: a few
+## times the longest retry delay the tests set.
+const _QUIET := 0.6
+## A URL with nothing listening, for a client that can't reach its server.
+const _NOWHERE := "ws://127.0.0.1:9"
 
 
 ## A client, and what it has seen.
 class Player:
 	var client: PlayholdClient
 	var status: int = PlayholdClient.Status.DISCONNECTED
+	var statuses: Array[int] = []
 	var code := ""
 	var view := ""
 	var errors: Array[int] = []
+	var closed_reasons: Array[int] = []
 
 
 var _url := OS.get_environment("PLAYHOLD_TEST_URL")
@@ -43,15 +51,21 @@ func _new_identity_path() -> String:
 	return path
 
 
-## Returns a player with its client in the tree, not yet connected. Without an identity file, it gets one of its own.
-func _player(identity_path := "") -> Player:
+## Returns a player with its client in the tree, not yet connected, retrying within a fraction of a second. Without an
+## identity file, it gets one of its own. The server's counter needs schema version 2.
+func _player(identity_path := "", counter_schema := 2) -> Player:
 	var p := Player.new()
 	p.client = PlayholdClient.new()
 	p.client.identity_path = identity_path if identity_path != "" else _new_identity_path()
-	p.client.schema_versions = {"counter": 2}
-	p.client.status_changed.connect(func(status: PlayholdClient.Status) -> void: p.status = status)
+	p.client.schema_versions = {"counter": counter_schema}
+	p.client.min_retry_delay = 0.05
+	p.client.max_retry_delay = 0.2
+	p.client.status_changed.connect(func(status: PlayholdClient.Status) -> void:
+		p.status = status
+		p.statuses.append(status))
 	p.client.room_joined.connect(func(code: String) -> void: p.code = code)
 	p.client.views_received.connect(func(views: Dictionary) -> void: p.view = _total(views))
+	p.client.room_closed.connect(func(reason: int) -> void: p.closed_reasons.append(reason))
 	p.client.server_error.connect(func(_seq: int, code: int, _message: String) -> void: p.errors.append(code))
 	add_child_autofree(p.client)
 	return p
@@ -86,6 +100,23 @@ func _amount(value: int) -> PackedByteArray:
 	var amount := Counter.Amount.new()
 	amount.set_value(value)
 	return amount.to_bytes()
+
+
+## Returns a ServerError frame, for the errors the test server can't be made to send.
+func _server_error(seq: int, code: int) -> PackedByteArray:
+	var frame := Frames.ServerFrame.new()
+	var error := frame.new_error()
+	error.set_seq(seq)
+	error.set_code(code)
+	return frame.to_bytes()
+
+
+## Waits until the player has lost its connection and is back in its room.
+func _until_back(p: Player) -> bool:
+	if not await _until(func() -> bool: return p.statuses.has(PlayholdClient.Status.DISCONNECTED)):
+		return false
+	return await _until(func() -> bool:
+		return p.statuses.back() == PlayholdClient.Status.JOINED and p.statuses.count(PlayholdClient.Status.JOINED) >= 2)
 
 
 func test_joins_plays_and_receives_views() -> void:
@@ -185,3 +216,129 @@ func test_join_refuses_another_room_and_send_needs_a_room() -> void:
 	assert_eq(p.client.create_room(), ERR_ALREADY_IN_USE)
 	assert_eq(p.client.connect_to_url(_url), OK)
 	assert_eq(p.client.connect_to_url(_url), ERR_ALREADY_IN_USE)
+
+
+func test_comes_back_after_a_dropped_connection_as_the_same_player_in_the_same_room() -> void:
+	var code := _new_code()
+	var p := _joined(code)
+	assert_true(await _until_joined(p), "joined")
+	var player_id := p.client.player_id
+	p.client.send("counter", _MSG_ADD, _amount(5))
+	assert_true(await _until_view(p, 5), "the view before the drop")
+
+	p.view = ""
+	p.client._socket.close() # the connection drops, as far as the client knows
+
+	assert_true(await _until_back(p), "back in the room")
+	assert_eq(p.client.player_id, player_id)
+	assert_eq(p.code, code)
+	assert_true(await _until_view(p, 5), "the same total after coming back")
+
+
+func test_keeps_retrying_a_server_it_cant_reach_until_closed() -> void:
+	var p := _player()
+	p.client.connect_to_url(_NOWHERE)
+
+	assert_true(await _until(func() -> bool: return p.statuses.count(PlayholdClient.Status.CONNECTING) >= 3), "retries")
+	assert_eq(p.client.connect_to_url(_url), ERR_ALREADY_IN_USE, "while waiting to retry")
+
+	p.client.close()
+	var seen := p.statuses.size()
+	await wait_seconds(_QUIET)
+
+	assert_eq(p.status, PlayholdClient.Status.CLOSED)
+	assert_eq(p.statuses.size(), seen, "no retry after close")
+
+
+func test_stops_when_the_same_player_connects_somewhere_newer() -> void:
+	var code := _new_code()
+	var path := _new_identity_path()
+	var first := _joined(code, path)
+	assert_true(await _until_joined(first), "first joined")
+
+	var second := _joined(code, path)
+
+	assert_true(await _until(func() -> bool: return first.status == PlayholdClient.Status.REPLACED), "replaced")
+	assert_true(await _until_joined(second), "second joined")
+	await wait_seconds(_QUIET)
+	assert_eq(first.status, PlayholdClient.Status.REPLACED, "no retry")
+
+
+func test_connecting_again_after_being_replaced_takes_the_player_back() -> void:
+	var code := _new_code()
+	var path := _new_identity_path()
+	var first := _joined(code, path)
+	assert_true(await _until_joined(first), "first joined")
+	var second := _joined(code, path)
+	assert_true(await _until(func() -> bool: return first.status == PlayholdClient.Status.REPLACED), "replaced")
+
+	assert_eq(first.client.connect_to_url(_url), OK)
+
+	assert_true(await _until(func() -> bool: return second.status == PlayholdClient.Status.REPLACED), "second replaced")
+	assert_true(await _until(func() -> bool: return first.status == PlayholdClient.Status.JOINED), "first back in")
+	assert_eq(first.code, code)
+
+
+func test_stops_when_the_server_says_the_game_is_too_old() -> void:
+	var p := _player("", 1) # the server's counter needs 2
+
+	p.client.connect_to_url(_url)
+
+	assert_true(await _until(func() -> bool: return p.status == PlayholdClient.Status.UPDATE_REQUIRED), "stopped")
+	assert_has(p.errors, Frames.ErrorCode.UPDATE_REQUIRED)
+	await wait_seconds(_QUIET)
+	assert_eq(p.status, PlayholdClient.Status.UPDATE_REQUIRED, "no retry")
+
+
+func test_tells_the_player_when_the_room_closes() -> void:
+	var p := _joined(_new_code())
+	assert_true(await _until_joined(p), "joined")
+
+	p.client.send("counter", _MSG_CLOSE, PackedByteArray())
+
+	assert_true(await _until(func() -> bool: return not p.closed_reasons.is_empty()), "room_closed")
+	assert_eq(p.closed_reasons.size(), 1)
+	assert_eq(p.closed_reasons[0], Frames.CloseReason.REQUESTED, "the counter closes its room on request")
+	assert_eq(p.status, PlayholdClient.Status.CONNECTED)
+	var next := _new_code()
+	assert_eq(p.client.join(next), OK, "the closed room is forgotten")
+	assert_true(await _until(func() -> bool: return p.status == PlayholdClient.Status.JOINED and p.code == next), "in another room")
+
+
+func test_comes_back_when_the_server_is_unavailable() -> void:
+	var code := _new_code()
+	var p := _joined(code)
+	assert_true(await _until_joined(p), "joined")
+
+	p.client._receive(_server_error(0, Frames.ErrorCode.UNAVAILABLE))
+
+	assert_true(await _until_back(p), "back in the room")
+	assert_eq(p.code, code)
+
+
+func test_comes_back_when_asked_to_slow_down_before_joining() -> void:
+	var p := _player()
+	p.client.connect_to_url(_url)
+	assert_true(await _until(func() -> bool: return p.status == PlayholdClient.Status.CONNECTED), "connected")
+	var code := _new_code()
+	p.client.join(code)
+
+	p.client._receive(_server_error(p.client._join_seq, Frames.ErrorCode.RATE_LIMITED))
+
+	assert_true(await _until(func() -> bool: return p.statuses.has(PlayholdClient.Status.DISCONNECTED)), "closed")
+	assert_true(await _until(func() -> bool: return p.status == PlayholdClient.Status.JOINED), "joined after the retry")
+	assert_eq(p.code, code, "the room was kept")
+
+
+func test_the_retry_delay_doubles_up_to_the_maximum_and_varies_by_half() -> void:
+	var client: PlayholdClient = autofree(PlayholdClient.new())
+	client.min_retry_delay = 1.0
+	client.max_retry_delay = 8.0
+
+	for _draw in 20: # the delay is random: a few draws each
+		var first := client._retry_delay(0)
+		assert_between(first, 0.5, 1.0, "the first")
+		var third := client._retry_delay(2)
+		assert_between(third, 2.0, 4.0, "the third doubled twice")
+		var late := client._retry_delay(30)
+		assert_between(late, 4.0, 8.0, "capped at the maximum")
