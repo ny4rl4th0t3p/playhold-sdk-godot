@@ -25,6 +25,11 @@ const (
 	maxPlayers        = 2
 	clientSchema      = 2 // not 1, so a client below it can be tested
 	readHeaderTimeout = 5 * time.Second
+
+	// The matcher runs often, so the tests don't wait for it, and a matched seat is kept briefly, so a player who never
+	// comes closes the room soon, but long enough for a client to join.
+	matchEvery = 10 * time.Millisecond
+	reserveFor = 500 * time.Millisecond
 )
 
 type total struct{ value int32 }
@@ -70,9 +75,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	// Development: it serves plain HTTP on localhost, for the SDK's tests, which also pick their rooms' codes.
+	// Development: it serves plain HTTP on localhost, for the SDK's tests, which also pick their rooms' codes, and queue
+	// to be matched in pairs, one room's seats. Every test player is a new guest, and the reconnect tests open many
+	// connections, all from one address, so the limits on new guests and connections per address are off.
 	server, err := playhold.NewServer(playhold.NewRuntime(playhold.Config{}), &playhold.ServerConfig{
 		RoomType: typ, Development: true, AllowClientCodes: true,
+		Matchmaking: &playhold.Matchmaking{Every: matchEvery, ReserveFor: reserveFor},
+		GuestRate:   playhold.RateLimit{Off: true},
+		ConnectRate: playhold.RateLimit{Off: true},
 	})
 	if err != nil {
 		return err

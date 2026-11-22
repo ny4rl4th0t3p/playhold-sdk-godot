@@ -4,7 +4,7 @@ extends Node
 ## and receiving what the player can see of it.
 ##
 ## Add it to the scene tree, usually as an autoload so the connection outlives a change of scene, then call
-## [method connect_to_url], and [method join] or [method create_room]. It polls its connection in
+## [method connect_to_url], and [method join], [method create_room] or [method queue]. It polls its connection in
 ## [method Node._process], and keeps running while the game is paused.
 ## [codeblock]
 ## var client := PlayholdClient.new()
@@ -42,6 +42,7 @@ enum Status {
 	REPLACED, ## The same player connected somewhere newer. Stopped until [method PlayholdClient.connect_to_url].
 	CLOSED, ## Stopped by [method PlayholdClient.close].
 	UPDATE_REQUIRED, ## This game is too old for the server, and has stopped. The player needs a newer one.
+	QUEUED, ## Waiting to be matched with other players. Once matched, the client joins the room by itself.
 }
 
 const Frames = preload("frames.gd")
@@ -88,6 +89,15 @@ var _wants_room := false
 var _code := ""
 ## The seq of the last Join sent, until the room answers; 0 for none.
 var _join_seq := 0
+## Whether the player wants a match, with [member _queue_properties]. Kept across lost connections, which drop the
+## player's place on the server.
+var _wants_queue := false
+var _queue_properties := {}
+## The seq of the last Queue sent, until the server answers; 0 for none.
+var _queue_seq := 0
+## Whether the client's room is one it was matched to, and with what, to queue again if the match falls through.
+var _was_matched := false
+var _matched_properties := {}
 
 
 func _init() -> void:
@@ -134,9 +144,44 @@ func join(code: String) -> Error:
 		return OK if code == _code else ERR_ALREADY_IN_USE
 	_wants_room = true
 	_code = code
+	_wants_queue = false # joining a room leaves the queue, on the server too
+	_queue_seq = 0
+	if _status == Status.QUEUED:
+		_set_status(Status.CONNECTED)
 	if _status == Status.CONNECTED:
 		_send_join()
 	return OK
+
+
+## Asks to be matched with other players, now or as soon as the client is connected; [member status] becomes
+## [constant QUEUED] once the server has the player waiting. [param properties] are the player's choices, such as a mode,
+## for the game's matcher; keys and values are sent as Strings. Once matched, the client joins the room by itself, and
+## [signal room_joined] reports its code. It queues again by itself after a lost connection, and when the room closes
+## because a matched player never came. Queueing again while queued replaces the properties. Returns
+## [constant ERR_ALREADY_IN_USE] when the client is in a room or joining one.
+func queue(properties := {}) -> Error:
+	if _wants_room:
+		return ERR_ALREADY_IN_USE
+	_queue_properties = {}
+	for key: Variant in properties:
+		_queue_properties[str(key)] = str(properties[key])
+	_wants_queue = true
+	if _status == Status.CONNECTED or _status == Status.QUEUED:
+		_send_queue()
+	return OK
+
+
+## Stops waiting for a match, and goes back to [constant CONNECTED]. Does nothing when not queued.
+func leave_queue() -> void:
+	if not _wants_queue:
+		return
+	_wants_queue = false
+	_queue_seq = 0
+	if _status == Status.CONNECTED or _status == Status.QUEUED:
+		var frame := _next_frame()
+		frame.new_leave_queue()
+		_send(frame)
+		_set_status(Status.CONNECTED)
 
 
 ## Creates a room, with a code the server makes, and enters it, now or as soon as the client is connected. The code
@@ -159,10 +204,12 @@ func send(module: String, id: int, payload: PackedByteArray) -> int:
 	return _send(frame)
 
 
-## Disconnects, stops connecting again, and forgets the room. The guest's identity is kept for next time.
+## Disconnects, stops connecting again, and forgets the room and the queue. The guest's identity is kept for next time.
 func close() -> void:
 	_wants_room = false
 	_code = ""
+	_wants_queue = false
+	_was_matched = false
 	_stop(Status.CLOSED)
 
 
@@ -179,12 +226,14 @@ func _open() -> Error:
 	return OK
 
 
-## The connection closed, or never opened, without [method close]. The room is kept, so the retry goes back to it.
+## The connection closed, or never opened, without [method close]. The room, or the wish for a match, is kept, so the
+## retry goes back to it.
 func _socket_closed() -> void:
 	var close_code := _socket.get_close_code()
 	_socket = null
 	_player_id = ""
 	_join_seq = 0
+	_queue_seq = 0
 	if close_code == _CLOSE_REPLACED:
 		_set_status(Status.REPLACED)
 		return
@@ -211,6 +260,7 @@ func _stop(new_status: Status) -> void:
 	_socket = null
 	_player_id = ""
 	_join_seq = 0
+	_queue_seq = 0
 	_set_status(new_status)
 
 
@@ -230,6 +280,10 @@ func _receive(bytes: PackedByteArray) -> void:
 			_room_closed(frame.get_closed())
 		Frames.ServerFrame.BodyCase.ERROR:
 			_failed(frame.get_error())
+		Frames.ServerFrame.BodyCase.QUEUED:
+			_queued(frame.get_queued())
+		Frames.ServerFrame.BodyCase.MATCHED:
+			_matched(frame.get_matched())
 
 
 func _welcomed(welcome: Frames.Welcome) -> void:
@@ -240,6 +294,27 @@ func _welcomed(welcome: Frames.Welcome) -> void:
 	_set_status(Status.CONNECTED)
 	if _wants_room:
 		_send_join()
+	elif _wants_queue:
+		_send_queue() # the server dropped the player's place when the connection was lost
+
+
+func _queued(queued: Frames.Queued) -> void:
+	if _wants_queue and queued.get_seq() == _queue_seq: # not an answer to a Queue the player has since left
+		_queue_seq = 0
+		_set_status(Status.QUEUED)
+
+
+## Joins the room the server matched this player to, at once, since its seat is kept only for a while.
+func _matched(matched: Frames.Matched) -> void:
+	if not _wants_queue or _wants_room:
+		return # the player stopped waiting meanwhile
+	_was_matched = true
+	_matched_properties = _queue_properties
+	_wants_queue = false
+	_queue_seq = 0
+	_wants_room = true
+	_code = matched.get_code()
+	_send_join()
 
 
 func _joined(joined: Frames.Joined) -> void:
@@ -257,11 +332,18 @@ func _views(state: Frames.RoomState) -> void:
 
 
 func _room_closed(closed: Frames.RoomClosed) -> void:
+	var reason: int = closed.get_reason()
+	var requeue := _was_matched and reason == Frames.CloseReason.MATCH_INCOMPLETE
+	var properties := _matched_properties
+	_was_matched = false
+	_matched_properties = {}
 	_wants_room = false
 	_code = ""
 	_join_seq = 0
 	_set_status(Status.CONNECTED)
-	room_closed.emit(closed.get_reason())
+	room_closed.emit(reason)
+	if requeue and not _wants_room and not _wants_queue:
+		queue(properties) # a matched player never came, so keep looking, unless the game chose something else
 
 
 func _failed(error: Frames.ServerError) -> void:
@@ -274,10 +356,12 @@ func _failed(error: Frames.ServerError) -> void:
 	elif code == Frames.ErrorCode.UNSUPPORTED_PROTOCOL or code == Frames.ErrorCode.UPDATE_REQUIRED:
 		_stop(Status.UPDATE_REQUIRED)
 	elif code == Frames.ErrorCode.UNAVAILABLE or (
-		code == Frames.ErrorCode.RATE_LIMITED and (_player_id == "" or (seq != 0 and seq == _join_seq))
+		code == Frames.ErrorCode.RATE_LIMITED
+		and (_player_id == "" or (seq != 0 and (seq == _join_seq or seq == _queue_seq)))
 	):
-		# The server couldn't check this player, or asked it to slow down before it got into its room. Closing leads
-		# to the usual retry, with its growing delay, and keeps the room to try again.
+		# The server couldn't check this player, or asked it to slow down before it got into its room or the queue.
+		# Closing leads to the usual retry, with its growing delay, and keeps the room, or the wish for a match, to try
+		# again.
 		if _socket != null:
 			_socket.close()
 	elif seq != 0 and seq == _join_seq:
@@ -285,6 +369,15 @@ func _failed(error: Frames.ServerError) -> void:
 		_wants_room = false
 		_code = ""
 		_join_seq = 0
+		_was_matched = false
+		if _status == Status.QUEUED:
+			_set_status(Status.CONNECTED) # a matched room that refused the player
+	elif seq != 0 and seq == _queue_seq:
+		# The server refused the queue, so stop asking.
+		_wants_queue = false
+		_queue_seq = 0
+		if _status == Status.QUEUED:
+			_set_status(Status.CONNECTED)
 	server_error.emit(seq, code, error.get_text())
 
 
@@ -305,6 +398,14 @@ func _send_join() -> void:
 	var frame := _next_frame()
 	frame.new_join().set_code(_code) # sent even when empty: that's how a new room is asked for
 	_join_seq = _send(frame)
+
+
+func _send_queue() -> void:
+	var frame := _next_frame()
+	var request := frame.new_queue()
+	for key: String in _queue_properties:
+		request.add_properties(key, _queue_properties[key])
+	_queue_seq = _send(frame)
 
 
 func _next_frame() -> Frames.ClientFrame:

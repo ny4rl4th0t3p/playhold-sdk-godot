@@ -1,7 +1,7 @@
 extends GutTest
 ## The client against the test server in testserver/, which make test starts and passes in PLAYHOLD_TEST_URL. The
 ## server's "counter" module adds to a total shared by the room, and shows each player "<player>:<total>". Rooms have
-## two seats, and clients may choose their codes.
+## two seats, clients may choose their codes, and queued players are matched in pairs, with a matched seat kept 500 ms.
 
 const Frames = preload("res://addons/playhold/frames.gd")
 const Identity = preload("res://addons/playhold/identity.gd")
@@ -27,6 +27,46 @@ class Player:
 	var view := ""
 	var errors: Array[int] = []
 	var closed_reasons: Array[int] = []
+
+
+## A player who queues and is matched, but never comes to the room, as a closed tab would: a bare socket that says Hello,
+## queues once welcomed, and ignores Matched.
+class Absent:
+	extends Node
+
+	const Frames = preload("res://addons/playhold/frames.gd")
+
+	var queued := false
+	var matched := false
+	var _socket := WebSocketPeer.new()
+	var _said_hello := false
+
+	func start(url: String) -> void:
+		_socket.connect_to_url(url)
+
+	func _process(_delta: float) -> void:
+		_socket.poll()
+		if _socket.get_ready_state() == WebSocketPeer.STATE_OPEN and not _said_hello:
+			_said_hello = true
+			var frame := Frames.ClientFrame.new()
+			frame.set_seq(1)
+			var hello := frame.new_hello()
+			hello.set_protocol_version(1)
+			hello.add_schema_versions("counter", 2)
+			_socket.send(frame.to_bytes(), WebSocketPeer.WRITE_MODE_BINARY)
+		while _socket.get_available_packet_count() > 0:
+			var frame := Frames.ServerFrame.new()
+			frame.from_bytes(_socket.get_packet())
+			match frame.get_body_case():
+				Frames.ServerFrame.BodyCase.WELCOME:
+					var request := Frames.ClientFrame.new()
+					request.set_seq(2)
+					request.new_queue()
+					_socket.send(request.to_bytes(), WebSocketPeer.WRITE_MODE_BINARY)
+				Frames.ServerFrame.BodyCase.QUEUED:
+					queued = true
+				Frames.ServerFrame.BodyCase.MATCHED:
+					matched = true
 
 
 var _url := OS.get_environment("PLAYHOLD_TEST_URL")
@@ -109,6 +149,24 @@ func _server_error(seq: int, code: int) -> PackedByteArray:
 	error.set_seq(seq)
 	error.set_code(code)
 	return frame.to_bytes()
+
+
+## Returns a player connecting and queueing.
+func _queueing() -> Player:
+	var p := _player()
+	p.client.queue()
+	p.client.connect_to_url(_url)
+	return p
+
+
+func _until_queued(p: Player) -> bool:
+	return await _until(func() -> bool: return p.status == PlayholdClient.Status.QUEUED)
+
+
+## Waits until both players are in the same room.
+func _until_together(a: Player, b: Player) -> bool:
+	return await _until(func() -> bool:
+		return a.status == PlayholdClient.Status.JOINED and b.status == PlayholdClient.Status.JOINED and a.code == b.code)
 
 
 ## Waits until the player has lost its connection and is back in its room.
@@ -342,3 +400,103 @@ func test_the_retry_delay_doubles_up_to_the_maximum_and_varies_by_half() -> void
 		assert_between(third, 2.0, 4.0, "the third doubled twice")
 		var late := client._retry_delay(30)
 		assert_between(late, 4.0, 8.0, "capped at the maximum")
+
+
+func test_matches_two_queued_players_into_one_room() -> void:
+	var alice := _queueing()
+	assert_true(await _until_queued(alice), "alice queued")
+
+	var bob := _queueing()
+
+	assert_true(await _until_together(alice, bob), "in the same room")
+	assert_has(bob.statuses, PlayholdClient.Status.QUEUED, "bob was queued first")
+	alice.client.send("counter", _MSG_ADD, _amount(1))
+	assert_true(await _until_view(bob, 1), "bob sees alice's add")
+
+
+func test_leaving_the_queue_means_not_being_matched() -> void:
+	var alice := _queueing()
+	assert_true(await _until_queued(alice), "alice queued")
+
+	alice.client.leave_queue()
+
+	assert_eq(alice.status, PlayholdClient.Status.CONNECTED)
+	var bob := _queueing()
+	assert_true(await _until_queued(bob), "bob queued")
+	await wait_seconds(_QUIET)
+	assert_eq(bob.status, PlayholdClient.Status.QUEUED, "bob still waiting, not matched with alice")
+	assert_eq(alice.status, PlayholdClient.Status.CONNECTED)
+
+
+func test_queues_again_after_a_lost_connection() -> void:
+	var alice := _queueing()
+	assert_true(await _until_queued(alice), "alice queued")
+
+	alice.client._socket.close()
+
+	assert_true(await _until(func() -> bool:
+		return alice.statuses.has(PlayholdClient.Status.DISCONNECTED) and alice.status == PlayholdClient.Status.QUEUED),
+		"queued again")
+	var bob := _queueing()
+	assert_true(await _until_together(alice, bob), "matched after coming back")
+
+
+func test_queues_again_when_a_matched_player_never_comes() -> void:
+	var absent: Absent = add_child_autofree(Absent.new())
+	absent.start(_url)
+	assert_true(await _until(func() -> bool: return absent.queued), "the absent player queued")
+	var alice := _queueing()
+	assert_true(await _until(func() -> bool: return absent.matched), "matched with the absent player")
+
+	assert_true(await _until(func() -> bool: return alice.closed_reasons.has(Frames.CloseReason.MATCH_INCOMPLETE)),
+		"the room closed without the absent player")
+	assert_true(await _until_queued(alice), "alice queued again")
+	var bob := _queueing()
+
+	assert_true(await _until_together(alice, bob), "matched with someone who came")
+
+
+func test_joining_leaves_the_queue_and_queueing_needs_no_room() -> void:
+	var alice := _queueing()
+	assert_true(await _until_queued(alice), "alice queued")
+	var code := _new_code()
+
+	assert_eq(alice.client.join(code), OK)
+
+	assert_true(await _until(func() -> bool: return alice.status == PlayholdClient.Status.JOINED and alice.code == code),
+		"in the room")
+	assert_eq(alice.client.queue(), ERR_ALREADY_IN_USE, "already in a room")
+
+
+func test_queue_properties_are_sent_as_strings() -> void:
+	var p := _player()
+
+	p.client.queue({"mode": "fast", "level": 3})
+
+	assert_eq_deep(p.client._queue_properties, {"mode": "fast", "level": "3"})
+
+
+func test_comes_back_and_queues_again_when_asked_to_slow_down() -> void:
+	var p := _player()
+	p.client.connect_to_url(_url)
+	assert_true(await _until(func() -> bool: return p.status == PlayholdClient.Status.CONNECTED), "connected")
+	p.client.queue()
+
+	p.client._receive(_server_error(p.client._queue_seq, Frames.ErrorCode.RATE_LIMITED))
+
+	assert_true(await _until(func() -> bool:
+		return p.statuses.has(PlayholdClient.Status.DISCONNECTED) and p.status == PlayholdClient.Status.QUEUED),
+		"queued after the retry")
+
+
+func test_stops_asking_when_the_queue_is_refused() -> void:
+	var p := _player()
+	p.client.connect_to_url(_url)
+	assert_true(await _until(func() -> bool: return p.status == PlayholdClient.Status.CONNECTED), "connected")
+	p.client.queue()
+
+	p.client._receive(_server_error(p.client._queue_seq, Frames.ErrorCode.REJECTED))
+
+	await wait_seconds(_QUIET)
+	assert_eq(p.status, PlayholdClient.Status.CONNECTED, "the server's Queued is ignored")
+	assert_has(p.errors, Frames.ErrorCode.REJECTED)
