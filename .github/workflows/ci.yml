@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # The same as GODOT_VERSION in the Makefile; make pin checks they match.
+  GODOT_VERSION: 4.7.2
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Go builds the test server and runs buf.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: testserver/go.mod
+      - name: Cache Godot
+        id: godot
+        uses: actions/cache@v6
+        with:
+          path: ~/godot
+          key: godot-${{ env.GODOT_VERSION }}-linux-x86_64
+      # The official build, checked against the release's own checksums.
+      - name: Download Godot
+        if: steps.godot.outputs.cache-hit != 'true'
+        run: |
+          base="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable"
+          name="Godot_v${GODOT_VERSION}-stable_linux.x86_64"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "$base/$name.zip"
+          curl -fsSLO "$base/SHA512-SUMS.txt"
+          grep " $name.zip\$" SHA512-SUMS.txt | sha512sum -c -
+          unzip -q "$name.zip"
+          mkdir -p ~/godot
+          mv "$name" ~/godot/godot
+      - run: echo "$HOME/godot" >> "$GITHUB_PATH"
+      - run: make check
+      - name: Check generated code is up to date
+        run: |
+          make gen
+          git diff --exit-code
