@@ -11,7 +11,12 @@ config_version=5
 [application]
 
 config/name="playhold-sdk-godot"
+run/main_scene="res://sample/main.tscn"
 config/features=PackedStringArray("4.7")
+
+[autoload]
+
+Playhold="*res://addons/playhold/client.gd"
 
 [rendering]
 

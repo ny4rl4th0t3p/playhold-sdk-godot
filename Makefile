@@ -14,6 +14,9 @@ GUT_REF := v9.7.1
 BUF_VERSION := v1.75.0
 BUF := go run github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
 PROTO := https://github.com/ny4rl4th0t3p/playhold.git\#tag=$(PLAYHOLD_VERSION),subdir=proto
+# The sample is the tutorial's tic-tac-toe, a client of its chapter 7 server, with that chapter's messages.
+TICTACTOE_VERSION := v0.5.0
+TICTACTOE_PROTO := https://github.com/ny4rl4th0t3p/playhold-tictactoe.git\#tag=$(TICTACTOE_VERSION),subdir=chapter7/proto
 
 # fetch copies folder $(3) of repository $(1), at commit or tag $(2), to $(4), through a clone in .tools/$(5). It
 # never deletes anything: if $(4) holds another ref, it stops and says what to delete.
@@ -46,10 +49,13 @@ tools: ## Fetch Godobuf and GUT into addons/, at their pinned refs
 	$(call fetch,$(GODOBUF_REPO),$(GODOBUF_REF),addons/godobuf,addons/godobuf,godobuf)
 	$(call fetch,$(GUT_REPO),$(GUT_REF),addons/gut,addons/gut,gut)
 
-gen: tools ## Generate addons/playhold/frames.gd from playhold's proto at PLAYHOLD_VERSION, and the tests' counter.gd
+gen: tools ## Generate frames.gd from playhold's proto at PLAYHOLD_VERSION, the sample's messages, and the tests' counter.gd
 	@mkdir -p addons/playhold
 	$(BUF) export '$(PROTO)' --path playhold/v1/frames.proto -o .tools/proto
 	$(call godobuf,.tools/proto/playhold/v1/frames.proto,addons/playhold/frames.gd)
+	$(BUF) export '$(TICTACTOE_PROTO)' -o .tools/tictactoe-proto
+	$(call godobuf,.tools/tictactoe-proto/tictactoe/v1/tictactoe.proto,sample/tictactoe.gd)
+	$(call godobuf,.tools/tictactoe-proto/tictactoe/v1/score.proto,sample/score.gd)
 	$(call godobuf,test/counter.proto,test/counter.gd)
 
 # test starts the test server, waits up to 10 s for the URL it prints, and passes it to the tests in PLAYHOLD_TEST_URL.

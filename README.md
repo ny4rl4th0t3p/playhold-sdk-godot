@@ -1,40 +1,83 @@
 # playhold-sdk-godot
 
 Connects a Godot game to a [playhold](https://github.com/ny4rl4th0t3p/playhold) server, in GDScript, so it runs in
-every export, the web included.
+every export, the web included: the guest's identity, joining a room or the matchmaking queue, sending messages and
+receiving views. It connects again by itself after a lost connection, and goes back to its room.
 
-> **Status: early development.** The client connects, keeps the guest's identity, joins and creates rooms, sends
-> messages, receives views, queues to be matched with other players, and connects again by itself after a lost
-> connection. A sample game comes next.
+> **Status: early development.** The API can change. `sample/` is a whole game: the tic-tac-toe of playhold's
+> [tutorial](https://ny4rl4th0t3p.github.io/playhold/tutorial/a-module.html), as a client of its chapter 7 server.
+
+## Install
+
+Copy `addons/playhold/` from a release into the game's own `addons/`, such as from a clone at its tag:
+
+```bash
+git clone --branch v0.5.0 https://github.com/ny4rl4th0t3p/playhold-sdk-godot.git
+```
+
+Then add `addons/playhold/client.gd` as an autoload, in Project Settings, Globals, Autoload, so the connection outlives
+a change of scene. The sample's is named `Playhold`.
+
+The game's own messages are protobuf, like the frames: generate GDScript from its `.proto` files with
+[Godobuf](https://github.com/oniksan/godobuf), at the commit in this repository's `Makefile`, either as its editor
+plugin or from the command line, as `make gen` does.
+
+## Use
+
+```gdscript
+func _ready() -> void:
+	Playhold.room_joined.connect(func(code): print("in room ", code))
+	Playhold.views_received.connect(_show) # a Dictionary from each module's name to its view's bytes
+	Playhold.connect_to_url("wss://game.example.com/ws")
+	Playhold.create_room() # or join(code), or queue()
+```
+
+`Playhold.send(module, id, payload)` sends a message to one of the room's modules. Every method and signal is
+documented in the editor's help, under `PlayholdClient`.
+
+A web export only runs over HTTPS, so its game server needs `wss://`, and it needs the Compatibility renderer.
 
 ## Versions
 
 An SDK `v0.X.y` is built for playhold `v0.X`, and works with any playhold `v0.X.*`. It's tested with Godot 4.7.2.
 
+## The sample
+
+Start the tutorial's chapter 7 server, then run this project (its main scene is `sample/main.tscn`):
+
+```bash
+cd playhold-tictactoe/chapter7 && go run ./server
+godot --path playhold-sdk-godot
+```
+
+For a second player on the same machine, run another copy with an identity of its own:
+`godot --path playhold-sdk-godot -- --player=2`. Another server: `-- --server=ws://192.168.1.20:8080/ws`. The sample
+also plays against chapter 7's browser page, over the same server.
+
 ## Development
 
 Needs Godot, Go and network access: the frames are generated from playhold's proto at the version in the `Makefile`,
-with [Godobuf](https://github.com/oniksan/godobuf), and the tests run with [GUT](https://github.com/bitwes/Gut). Both
-are fetched into `addons/` at the versions in the `Makefile`, and left out of git. `testserver/` is a small Go game
-server on the same playhold version, for the client's tests.
+and the sample's messages from the tutorial's, with [Godobuf](https://github.com/oniksan/godobuf), and the tests run
+with [GUT](https://github.com/bitwes/Gut). Both are fetched into `addons/` at the versions in the `Makefile`, and left
+out of git. `testserver/` is a small Go game server on the same playhold version, for the client's tests.
 
-The repository is a Godot project, to run the tests and the generator; a game copies only `addons/playhold/`. It uses
-the Compatibility renderer, the only one a web export supports, so the tests run on what a web game would. GUT reads
-which tests to run from `.gutconfig.json`.
+The repository is a Godot project, to run the tests, the generator and the sample; a game copies only
+`addons/playhold/`. It uses the Compatibility renderer, the only one a web export supports, so the tests run on what a
+web game would. GUT reads which tests to run from `.gutconfig.json`.
 
 ```bash
 make tools   # fetch Godobuf and GUT
 make check   # run the tests against the test server, build it, and check the pinned versions
-make gen     # generate addons/playhold/frames.gd from playhold's proto at PLAYHOLD_VERSION, and test/counter.gd
+make gen     # generate frames.gd, the sample's messages, and the tests' counter.gd
 make tidy    # tidy the test server's module
 ```
 
 If Godot isn't `godot` on your `PATH`, pass it: `make check GODOT=/path/to/godot`.
 
-To move to a new playhold version: change `PLAYHOLD_VERSION` in the `Makefile`, require the same version in
-`testserver/go.mod`, then `make tidy gen check`.
+To move to a new playhold version: change `PLAYHOLD_VERSION` and `TICTACTOE_VERSION` in the `Makefile`, require the
+same playhold version in `testserver/go.mod`, then `make tidy gen check`.
 
 ## License
 
-[Apache-2.0](LICENSE). `addons/playhold/frames.gd` is generated by Godobuf, which writes its own runtime into the file,
-under the BSD 3-Clause license in its header.
+[Apache-2.0](LICENSE). The `.gd` files generated by Godobuf, `addons/playhold/frames.gd` and the sample's messages,
+carry Godobuf's runtime, under the BSD 3-Clause license in their headers.
